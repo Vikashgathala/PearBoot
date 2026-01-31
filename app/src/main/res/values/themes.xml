@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- App theme -->
+
+
+    <!-- Splash theme -->
+    <style name="Theme.PearBoot.Splash" parent="android:Theme.Material.Light.NoActionBar">
+
+        <!-- Splash background -->
+        <item name="android:windowSplashScreenBackground">
+            @color/ic_splash_background
+        </item>
+
+        <!-- Splash icon -->
+        <item name="android:windowSplashScreenAnimatedIcon">
+            @mipmap/ic_splash
+        </item>
+
+        <!-- Icon background (Android 12+) -->
+        <item name="android:windowSplashScreenIconBackgroundColor">
+            @color/ic_splash_background
+        </item>
+
+        <!-- Theme after splash -->
+        <item name="postSplashScreenTheme">
+            @style/Theme.PearBoot
+        </item>
+
+    </style>
+
+    <style name="Theme.PearBoot" parent="android:Theme.Material.Light.NoActionBar" />
+
+</resources>
