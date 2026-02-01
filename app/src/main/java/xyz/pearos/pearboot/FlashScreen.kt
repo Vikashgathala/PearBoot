@@ -1,5 +1,10 @@
 package xyz.pearos.pearboot.ui.flash
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -11,6 +16,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Usb
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,8 +24,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import xyz.pearos.pearboot.R
@@ -32,6 +42,16 @@ fun FlashScreen() {
 
     val ctx = LocalContext.current
     val isConnected by UsbHelper.connected.collectAsState()
+    val pendriveName by UsbHelper.name.collectAsState()
+    val pendriveSize by UsbHelper.size.collectAsState()
+    val needsFormat by UsbHelper.needsFormat.collectAsState()
+    val isFormatting by UsbHelper.isFormatting.collectAsState()
+    val formatProgress by UsbHelper.formatProgress.collectAsState()
+
+    // Format dialog state
+    var showFormatDialog by remember { mutableStateOf(false) }
+    var formatError by remember { mutableStateOf<String?>(null) }
+    var showFormatErrorDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(isConnected) {
         if (!isConnected) {
@@ -42,11 +62,7 @@ fun FlashScreen() {
         }
     }
 
-    /* ---------- USB STATE ---------- */
-    val pendriveName by UsbHelper.name.collectAsState()
-    val pendriveSize by UsbHelper.size.collectAsState()
-
-    /* ---------- DOWNLOAD VERIFIED STATE ---------- */
+    // Download verified state
     var isDownloaded by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -54,10 +70,99 @@ fun FlashScreen() {
         isDownloaded = prefs[DownloadKeys.COMPLETED] == true
     }
 
-    /* ---------- DUMMY DISTRO DATA ---------- */
+    // Dummy distro data
     val distroName = "pearOS NiceCore"
     val distroVersion = "2025.12"
     val distroSize = "3.51 GB"
+
+    // Format confirmation dialog
+    if (showFormatDialog) {
+        AlertDialog(
+            onDismissRequest = { showFormatDialog = false },
+            icon = {
+                Icon(
+                    Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(32.dp)
+                )
+            },
+            title = {
+                Text(
+                    "Format Drive?",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
+                    Text(
+                        "Formatting will erase all data on this drive:",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        pendriveName.ifEmpty { "USB Drive" },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "This action cannot be undone. Are you sure you want to continue?",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showFormatDialog = false
+                        UsbHelper.formatDevice { success, message ->
+                            if (!success) {
+                                formatError = message
+                                showFormatErrorDialog = true
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Yes, Format")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = { showFormatDialog = false }
+                ) {
+                    Text("No, Cancel")
+                }
+            }
+        )
+    }
+
+    // Format error dialog
+    if (showFormatErrorDialog) {
+        AlertDialog(
+            onDismissRequest = { showFormatErrorDialog = false },
+            icon = {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = { Text("Format Failed") },
+            text = { Text(formatError ?: "Unknown error occurred") },
+            confirmButton = {
+                Button(onClick = { showFormatErrorDialog = false }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -191,28 +296,111 @@ fun FlashScreen() {
 
             /* ===== PENDRIVE CARD ===== */
             GlassSurface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(100.dp),
+                modifier = Modifier.fillMaxWidth(),
                 cornerRadius = 28.dp,
                 padding = PaddingValues(20.dp)
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
 
-                    Icon(Icons.Default.Usb, null, modifier = Modifier.size(26.dp))
-                    Spacer(Modifier.width(14.dp))
+                        Icon(Icons.Default.Usb, null, modifier = Modifier.size(26.dp))
+                        Spacer(Modifier.width(14.dp))
 
-                    Column {
-                        Text(
-                            if (pendriveName.isNotEmpty()) pendriveName else "No device",
-                            style = MaterialTheme.typography.titleMedium
-                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                if (pendriveName.isNotEmpty()) pendriveName else "No device",
+                                style = MaterialTheme.typography.titleMedium
+                            )
 
-                        Text(
-                            if (pendriveSize.isNotEmpty()) pendriveSize else "",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            Text(
+                                if (pendriveSize.isNotEmpty()) pendriveSize else "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    /* ===== FORMAT SECTION (Expandable) ===== */
+                    AnimatedVisibility(
+                        visible = isConnected && (needsFormat || isFormatting),
+                        enter = fadeIn() + expandVertically(),
+                        exit = fadeOut() + shrinkVertically()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(top = 16.dp)
+                        ) {
+                            Divider(
+                                color = MaterialTheme.colorScheme.outlineVariant,
+                                modifier = Modifier.padding(bottom = 16.dp)
+                            )
+
+                            if (isFormatting) {
+                                /* ===== FORMATTING IN PROGRESS ===== */
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    CircularProgressIndicator(
+                                        progress = if (formatProgress > 0) formatProgress else 0f,
+                                        modifier = Modifier.size(24.dp),
+                                        strokeWidth = 3.dp
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Formatting...",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        Text(
+                                            "${(formatProgress * 100).toInt()}%",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            } else {
+                                /* ===== NEEDS FORMAT MESSAGE ===== */
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(
+                                        Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Unsupported filesystem",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                        Text(
+                                            "Format to FAT32 to continue",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Spacer(Modifier.width(12.dp))
+                                    Button(
+                                        onClick = { showFormatDialog = true },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.error
+                                        ),
+                                        contentPadding = PaddingValues(
+                                            horizontal = 16.dp,
+                                            vertical = 8.dp
+                                        )
+                                    ) {
+                                        Text("Format")
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
