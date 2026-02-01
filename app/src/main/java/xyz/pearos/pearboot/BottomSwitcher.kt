@@ -38,7 +38,7 @@ fun BottomSwitcher(
 
     LaunchedEffect(selectedIndex) {
         barScale.animateTo(
-            1.06f,
+            1.01f,
             animationSpec = spring(stiffness = 420f, dampingRatio = 0.85f)
         )
         delay(90)

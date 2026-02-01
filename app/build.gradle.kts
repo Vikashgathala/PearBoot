@@ -55,7 +55,7 @@ dependencies {
     // Lifecycle
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
+    implementation("me.jahnen:libaums:0.9.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.compose.material3:material3")
     implementation ("androidx.compose.material:material-icons-extended")

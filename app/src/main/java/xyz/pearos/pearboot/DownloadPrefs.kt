@@ -12,4 +12,7 @@ object DownloadKeys {
     val BYTES = longPreferencesKey("bytes")
     val TOTAL = longPreferencesKey("total")
     val COMPLETED = booleanPreferencesKey("completed")
+
+    // 🔥 ADD THIS
+    val VERIFIED_SHA256 = stringPreferencesKey("verified_sha256")
 }
