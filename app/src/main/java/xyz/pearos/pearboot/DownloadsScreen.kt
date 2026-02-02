@@ -15,10 +15,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Dp
@@ -39,6 +41,7 @@ fun DownloadsScreen(
     val downloaded by vm.downloadedBytes.collectAsState()
     val progress by vm.progress.collectAsState()
     val speed by vm.speedMbps.collectAsState()
+    val verificationProgress by vm.verificationProgress.collectAsState()
 
     var warningExpanded by remember { mutableStateOf(false) }
 
@@ -51,7 +54,7 @@ fun DownloadsScreen(
 
         Spacer(Modifier.height(28.dp))
 
-        /* ===== SERVER STATUS PILL (UNCHANGED) ===== */
+        /* ===== SERVER STATUS PILL ===== */
         GlassSurface(
             cornerRadius = 22.dp,
             padding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
@@ -92,12 +95,16 @@ fun DownloadsScreen(
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 
-                        Text("Releases", style = MaterialTheme.typography.titleMedium, fontSize = 43.sp)
+                        Text(
+                            "Releases",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontSize = 43.sp
+                        )
                         Text(meta.distro.name)
                         Text("Version ${meta.version.name}")
                         Text("%.2f GB".format(meta.file.size_bytes / 1e9))
 
-                        /* ===== CHECKSUM (ADDED, NO OTHER CHANGE) ===== */
+                        /* ===== CHECKSUM ===== */
                         Text(
                             "SHA256",
                             style = MaterialTheme.typography.labelMedium,
@@ -109,70 +116,219 @@ fun DownloadsScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
-                        if (state == DownloadState.DOWNLOADING || state == DownloadState.VERIFYING) {
-                            LinearProgressIndicator(
-                                progress = progress,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Text(
-                                "${"%.2f".format(downloaded / 1e9)} / " +
-                                        "${"%.2f".format(meta.file.size_bytes / 1e9)} GB"
-                            )
+                        Spacer(Modifier.height(8.dp))
+
+
+                        AnimatedVisibility(
+                            visible = state == DownloadState.DOWNLOADING,
+                            enter = fadeIn() + expandVertically(),
+                            exit = fadeOut() + shrinkVertically()
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    "Downloading",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                LinearProgressIndicator(
+                                    progress = { progress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(4.dp))
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        "${"%.2f".format(downloaded / 1e9)} / ${"%.2f".format(meta.file.size_bytes / 1e9)} GB",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Text(
+                                        "${"%.2f".format(speed)} MB/s",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
                         }
 
-                        AnimatedVisibility(state == DownloadState.DOWNLOADING) {
-                            Text("${"%.2f".format(speed)} MB/s")
-                        }
-
-                        when (state) {
-                            DownloadState.NOT_DOWNLOADED ->
-                                Button(
-                                    onClick = vm::startOrResume,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("Download") }
-
-                            DownloadState.PAUSED ->
-                                Button(
-                                    onClick = vm::startOrResume,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("Resume") }
-
-                            DownloadState.DOWNLOADING ->
-                                OutlinedButton(
-                                    onClick = vm::pause,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("Pause") }
-
-                            DownloadState.VERIFYING ->
+                        // Verification progress section
+                        AnimatedVisibility(
+                            visible = state == DownloadState.VERIFYING,
+                            enter = fadeIn() + expandVertically(),
+                            exit = fadeOut() + shrinkVertically()
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     CircularProgressIndicator(
                                         modifier = Modifier.size(18.dp),
-                                        strokeWidth = 2.dp
+                                        strokeWidth = 2.dp,
+                                        color = Color(0xFF2196F3)
                                     )
                                     Spacer(Modifier.width(8.dp))
-                                    Text("Verifying")
+                                    Text(
+                                        "Verifying integrity...",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color(0xFF2196F3)
+                                    )
                                 }
+                                LinearProgressIndicator(
+                                    progress = { verificationProgress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(4.dp)),
+                                    color = Color(0xFF2196F3)
+                                )
+                                Text(
+                                    "Computing SHA-256 checksum: ${(verificationProgress * 100).toInt()}%",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
 
-                            DownloadState.VERIFIED ->
-                                Row(verticalAlignment = Alignment.CenterVertically) {
+                        // Paused state - show resume info
+                        AnimatedVisibility(
+                            visible = state == DownloadState.PAUSED,
+                            enter = fadeIn() + expandVertically(),
+                            exit = fadeOut() + shrinkVertically()
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    "Download Paused",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                LinearProgressIndicator(
+                                    progress = { progress },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(4.dp)),
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                                Text(
+                                    "${"%.2f".format(downloaded / 1e9)} / ${"%.2f".format(meta.file.size_bytes / 1e9)} GB (${(progress * 100).toInt()}%)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        // Action buttons based on state
+                        when (state) {
+                            DownloadState.NOT_DOWNLOADED -> {
+                                Button(
+                                    onClick = vm::startOrResume,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Download")
+                                }
+                            }
+
+                            DownloadState.PAUSED -> {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    Button(
+                                        onClick = vm::startOrResume,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Resume")
+                                    }
+                                    OutlinedButton(
+                                        onClick = vm::delete,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Delete")
+                                    }
+                                }
+                            }
+
+                            DownloadState.DOWNLOADING -> {
+                                OutlinedButton(
+                                    onClick = vm::pause,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Pause")
+                                }
+                            }
+
+                            DownloadState.VERIFYING -> {
+                                // Show nothing, verification in progress
+                            }
+
+                            DownloadState.VERIFIED -> {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
                                     Icon(
                                         Icons.Default.CheckCircle,
                                         contentDescription = null,
-                                        tint = Color(0xFF4CAF50)
+                                        tint = Color(0xFF4CAF50),
+                                        modifier = Modifier.size(24.dp)
                                     )
                                     Spacer(Modifier.width(8.dp))
-                                    Text("Verified")
-                                    Spacer(Modifier.weight(1f))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Verified",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = Color(0xFF4CAF50)
+                                        )
+                                        Text(
+                                            "Ready to flash",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                     OutlinedButton(onClick = vm::delete) {
                                         Text("Delete")
                                     }
                                 }
+                            }
 
-                            DownloadState.CORRUPT ->
-                                Button(
-                                    onClick = vm::delete,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text("Delete") }
+                            DownloadState.CORRUPT -> {
+                                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            Icons.Default.Error,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Spacer(Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                "Verification Failed",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.error
+                                            )
+                                            Text(
+                                                "File is corrupted or incomplete",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    Button(
+                                        onClick = vm::delete,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.error
+                                        )
+                                    ) {
+                                        Text("Delete and Re-download")
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -218,7 +374,7 @@ fun DownloadsScreen(
     }
 }
 
-/* ===== GLASS SURFACE (UNCHANGED) ===== */
+/* ===== GLASS SURFACE ===== */
 @Composable
 fun GlassSurface(
     modifier: Modifier = Modifier,

@@ -33,7 +33,7 @@ fun BottomSwitcher(
     val tabWidth = 100.dp
     val tabWidthPx = with(density) { tabWidth.toPx() }
 
-    /* ---------- Bar scale animation ---------- */
+
     val barScale = remember { Animatable(1f) }
 
     LaunchedEffect(selectedIndex) {
@@ -48,7 +48,7 @@ fun BottomSwitcher(
         )
     }
 
-    /* ---------- Pill position ---------- */
+
     val pillOffsetDp by animateDpAsState(
         targetValue = with(density) {
             (selectedIndex * tabWidthPx).toDp()
@@ -78,7 +78,7 @@ fun BottomSwitcher(
             )
     ) {
 
-        /* ---------- Highlight pill ---------- */
+
         Box(
             modifier = Modifier
                 .offset(x = pillOffsetDp)
@@ -89,7 +89,7 @@ fun BottomSwitcher(
                 .background(colors.secondaryContainer)
         )
 
-        /* ---------- Tabs ---------- */
+
         Row(
             modifier = Modifier.fillMaxSize(),
             horizontalArrangement = Arrangement.SpaceEvenly,

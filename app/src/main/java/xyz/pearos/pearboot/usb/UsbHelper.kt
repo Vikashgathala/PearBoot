@@ -9,20 +9,42 @@ import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import me.jahnen.libaums.core.UsbMassStorageDevice
 import me.jahnen.libaums.core.driver.BlockDeviceDriver
 import me.jahnen.libaums.core.driver.BlockDeviceDriverFactory
 import me.jahnen.libaums.core.usb.UsbCommunication
+import java.io.File
+import java.io.FileInputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 
 object UsbHelper {
 
     private const val TAG = "UsbHelper"
     const val ACTION_USB_PERMISSION = "xyz.pearos.USB_PERMISSION"
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Write settings
+    private const val DEFAULT_BLOCK_SIZE = 512
+    private const val MIN_BLOCK_SIZE = 512
+    private const val MAX_BLOCK_SIZE = 4096
+    private const val WRITE_SECTORS_PER_CHUNK = 128  // 64KB at 512 bytes/sector
+    private const val READ_BLOCK_SIZE = 512 * 1024
+    private const val MAX_RETRIES = 5
+    private const val RETRY_DELAY_MS = 500L
+    private const val RECONNECT_DELAY_MS = 2000L
+    private const val POST_WRITE_SETTLE_MS = 3000L  // Time to let device settle after writing
 
+    // Sectors to wipe before flashing
+    private const val SECTORS_TO_WIPE = 2048  // First 1MB
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val writeMutex = Mutex()
+
+    // Connection states
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected
 
@@ -41,12 +63,62 @@ object UsbHelper {
     private val _formatProgress = MutableStateFlow(0f)
     val formatProgress: StateFlow<Float> = _formatProgress
 
-    // Store references
+    // Flash states
+    private val _isFlashing = MutableStateFlow(false)
+    val isFlashing: StateFlow<Boolean> = _isFlashing
+
+    private val _flashProgress = MutableStateFlow(0f)
+    val flashProgress: StateFlow<Float> = _flashProgress
+
+    private val _flashLogs = MutableStateFlow<List<String>>(emptyList())
+    val flashLogs: StateFlow<List<String>> = _flashLogs
+
+    private val _flashComplete = MutableStateFlow(false)
+    val flashComplete: StateFlow<Boolean> = _flashComplete
+
+    private val _flashError = MutableStateFlow<String?>(null)
+    val flashError: StateFlow<String?> = _flashError
+
+    // Verification states
+    private val _isVerifying = MutableStateFlow(false)
+    val isVerifying: StateFlow<Boolean> = _isVerifying
+
+    private val _verificationProgress = MutableStateFlow(0f)
+    val verificationProgress: StateFlow<Float> = _verificationProgress
+
+    // Preparation state
+    private val _isPreparing = MutableStateFlow(false)
+    val isPreparing: StateFlow<Boolean> = _isPreparing
+
+    // Device references
     private var currentMassStorageDevice: UsbMassStorageDevice? = null
     private var currentBlockDevice: BlockDeviceDriver? = null
-    private var cachedBlockSize: Int = 512
+    private var cachedBlockSize: Int = DEFAULT_BLOCK_SIZE
     private var cachedTotalBlocks: Long = 0L
     private var appContext: Context? = null
+
+    private var flashJob: Job? = null
+
+    /**
+     * Validate and normalize block size
+     */
+    private fun validateBlockSize(reportedSize: Int): Int {
+        return when {
+            reportedSize < MIN_BLOCK_SIZE -> {
+                Log.w(TAG, "Block size $reportedSize too small, using $DEFAULT_BLOCK_SIZE")
+                DEFAULT_BLOCK_SIZE
+            }
+            reportedSize > MAX_BLOCK_SIZE -> {
+                Log.w(TAG, "Block size $reportedSize too large, using $DEFAULT_BLOCK_SIZE")
+                DEFAULT_BLOCK_SIZE
+            }
+            reportedSize % MIN_BLOCK_SIZE != 0 -> {
+                Log.w(TAG, "Block size $reportedSize not aligned, using $DEFAULT_BLOCK_SIZE")
+                DEFAULT_BLOCK_SIZE
+            }
+            else -> reportedSize
+        }
+    }
 
     fun scan(context: Context) {
         appContext = context.applicationContext
@@ -67,7 +139,6 @@ object UsbHelper {
 
         scope.launch {
             try {
-                // Close any existing device first
                 closeCurrentDevice()
 
                 val massDevices = UsbMassStorageDevice.getMassStorageDevices(context)
@@ -83,7 +154,6 @@ object UsbHelper {
 
                 currentMassStorageDevice = massStorageDevice
 
-                // Get device name
                 val deviceName = device.productName?.trim()?.ifEmpty { null }
                     ?: device.manufacturerName?.trim()?.ifEmpty { null }
                     ?: device.deviceName
@@ -94,53 +164,30 @@ object UsbHelper {
 
                 Log.d(TAG, "Device connected: $deviceName")
 
-                // Create block device directly using usbCommunication
-                val blockDevice = createBlockDevice(massStorageDevice)
+                val blockDevice = createBlockDeviceRaw(massStorageDevice)
 
                 if (blockDevice != null) {
                     currentBlockDevice = blockDevice
 
-                    cachedBlockSize = blockDevice.blockSize
+                    val reportedBlockSize = blockDevice.blockSize
+                    cachedBlockSize = validateBlockSize(reportedBlockSize)
                     cachedTotalBlocks = blockDevice.blocks
 
                     Log.d(TAG, "BlockDevice created successfully!")
-                    Log.d(TAG, "  - Block size: $cachedBlockSize")
+                    Log.d(TAG, "  - Reported block size: $reportedBlockSize")
+                    Log.d(TAG, "  - Using block size: $cachedBlockSize")
                     Log.d(TAG, "  - Total blocks: $cachedTotalBlocks")
-                    Log.d(TAG, "  - Last block address: ${cachedTotalBlocks - 1}")
 
                     val capacityBytes = cachedTotalBlocks * cachedBlockSize.toLong()
-
-                    Log.d(TAG, "  - Total capacity: $capacityBytes bytes (${formatSize(capacityBytes)})")
-
                     _size.value = formatSize(capacityBytes)
 
-                    // Check if filesystem is supported
-                    val partitions = try {
-                        massStorageDevice.partitions
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error getting partitions: ${e.message}")
-                        emptyList()
-                    }
+                    _needsFormat.value = false
 
-                    val hasValidFs = partitions.isNotEmpty() && partitions.any {
-                        try {
-                            it.fileSystem != null
-                        } catch (e: Exception) {
-                            false
-                        }
-                    }
-
-                    if (hasValidFs) {
-                        _needsFormat.value = false
-                        Log.i(TAG, "USB Connected with valid filesystem: $deviceName, Size: ${_size.value}")
-                    } else {
-                        _needsFormat.value = true
-                        Log.w(TAG, "USB Connected but filesystem unsupported: $deviceName, Size: ${_size.value}")
-                    }
+                    Log.i(TAG, "USB Connected: $deviceName, Size: ${_size.value}")
                 } else {
                     Log.e(TAG, "Could not create block device")
                     _size.value = "Unknown"
-                    _needsFormat.value = true
+                    _needsFormat.value = false
                 }
 
             } catch (e: Exception) {
@@ -151,13 +198,8 @@ object UsbHelper {
         }
     }
 
-    /**
-     * Create a BlockDeviceDriver by extracting usbCommunication from UsbMassStorageDevice
-     * and using BlockDeviceDriverFactory
-     */
-    private fun createBlockDevice(massStorageDevice: UsbMassStorageDevice): BlockDeviceDriver? {
+    private fun createBlockDeviceRaw(massStorageDevice: UsbMassStorageDevice): BlockDeviceDriver? {
         try {
-            // Get usbCommunication field via reflection
             val usbCommField = massStorageDevice.javaClass.getDeclaredField("usbCommunication")
             usbCommField.isAccessible = true
             val usbCommunication = usbCommField.get(massStorageDevice)
@@ -169,17 +211,14 @@ object UsbHelper {
 
             Log.d(TAG, "Got usbCommunication: ${usbCommunication.javaClass.name}")
 
-            // Cast to UsbCommunication interface
             if (usbCommunication !is UsbCommunication) {
                 Log.e(TAG, "usbCommunication is not UsbCommunication type")
                 return null
             }
 
-            // Create block device using the factory with LUN 0
             val blockDevice = BlockDeviceDriverFactory.createBlockDevice(usbCommunication, 0.toByte())
             Log.d(TAG, "Created BlockDevice: ${blockDevice.javaClass.name}")
 
-            // Initialize the block device
             blockDevice.init()
             Log.d(TAG, "BlockDevice initialized")
 
@@ -203,70 +242,432 @@ object UsbHelper {
     }
 
     /**
-     * Ensure we have a valid block device, reinitializing if necessary
+     * Create a fresh block device connection - essential after prolonged writing
      */
-    private suspend fun ensureBlockDevice(context: Context): Boolean {
-        if (currentBlockDevice != null && cachedTotalBlocks > 0) {
-            Log.d(TAG, "Block device already available")
-            return true
+    private suspend fun createFreshBlockDevice(context: Context, settleTime: Long = 500L): BlockDeviceDriver? {
+        Log.d(TAG, "Creating fresh block device connection...")
+
+        // Close existing connection first
+        closeCurrentDevice()
+
+        // Give device time to settle
+        delay(settleTime)
+
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+                val devices = manager.deviceList.values
+
+                if (devices.isEmpty()) {
+                    Log.e(TAG, "No USB devices found (attempt ${attempt + 1})")
+                    delay(RECONNECT_DELAY_MS)
+                    return@repeat
+                }
+
+                val device = devices.first()
+
+                if (!manager.hasPermission(device)) {
+                    Log.e(TAG, "No permission for USB device")
+                    return null
+                }
+
+                val massDevices = UsbMassStorageDevice.getMassStorageDevices(context)
+                if (massDevices.isEmpty()) {
+                    Log.e(TAG, "No mass storage devices found (attempt ${attempt + 1})")
+                    delay(RECONNECT_DELAY_MS)
+                    return@repeat
+                }
+
+                val massStorageDevice = massDevices[0]
+                massStorageDevice.init()
+                currentMassStorageDevice = massStorageDevice
+
+                val blockDevice = createBlockDeviceRaw(massStorageDevice)
+                if (blockDevice != null) {
+                    currentBlockDevice = blockDevice
+
+                    val reportedBlockSize = blockDevice.blockSize
+                    cachedBlockSize = validateBlockSize(reportedBlockSize)
+                    cachedTotalBlocks = blockDevice.blocks
+
+                    Log.d(TAG, "Fresh block device created successfully (attempt ${attempt + 1})")
+                    Log.d(TAG, "  - Block size: $cachedBlockSize")
+                    Log.d(TAG, "  - Total blocks: $cachedTotalBlocks")
+                    return blockDevice
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error creating fresh block device (attempt ${attempt + 1}): ${e.message}")
+                closeCurrentDevice()
+                if (attempt < MAX_RETRIES - 1) {
+                    delay(RECONNECT_DELAY_MS)
+                }
+            }
         }
 
-        Log.d(TAG, "Block device not available, re-initializing...")
+        Log.e(TAG, "Could not create fresh block device after $MAX_RETRIES attempts")
+        return null
+    }
 
-        val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val devices = manager.deviceList.values
+    private fun addLog(message: String) {
+        val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date())
+        _flashLogs.value = _flashLogs.value + "[$timestamp] $message"
+        Log.d(TAG, message)
+    }
 
-        if (devices.isEmpty()) {
-            Log.e(TAG, "No USB devices found")
-            return false
+    /**
+     * Create a zero-filled buffer for wiping sectors
+     */
+    private fun createZeroBuffer(sectorCount: Int): ByteBuffer {
+        val size = sectorCount * cachedBlockSize
+        return ByteBuffer.allocate(size).apply {
+            order(ByteOrder.LITTLE_ENDIAN)
+            clear()
         }
+    }
 
-        val device = devices.first()
-
-        if (!manager.hasPermission(device)) {
-            Log.e(TAG, "No permission for USB device")
-            return false
+    /**
+     * Write a single sector of zeros
+     */
+    private suspend fun writeZeroSector(
+        blockDevice: BlockDeviceDriver,
+        sectorNumber: Long
+    ): Boolean {
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val buffer = createZeroBuffer(1)
+                writeMutex.withLock {
+                    blockDevice.write(sectorNumber, buffer)
+                }
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "Write zero sector $sectorNumber failed (attempt ${attempt + 1}): ${e.message}")
+                if (attempt < MAX_RETRIES - 1) {
+                    delay(RETRY_DELAY_MS * (attempt + 1))
+                }
+            }
         }
+        return false
+    }
+
+    /**
+     * Write multiple sectors of zeros
+     */
+    private suspend fun writeZeroSectors(
+        blockDevice: BlockDeviceDriver,
+        startSector: Long,
+        sectorCount: Int
+    ): Boolean {
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val buffer = createZeroBuffer(sectorCount)
+                writeMutex.withLock {
+                    blockDevice.write(startSector, buffer)
+                }
+                return true
+            } catch (e: Exception) {
+                Log.w(TAG, "Write zero sectors $startSector-${startSector + sectorCount} failed (attempt ${attempt + 1}): ${e.message}")
+                if (attempt < MAX_RETRIES - 1) {
+                    delay(RETRY_DELAY_MS * (attempt + 1))
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * Prepare drive for flashing
+     */
+    private suspend fun prepareDriveForFlashing(
+        blockDevice: BlockDeviceDriver,
+        context: Context
+    ): Boolean {
+        addLog("Preparing drive for flashing...")
+
+        _isPreparing.value = true
 
         try {
-            closeCurrentDevice()
+            val sectorsToWipe = SECTORS_TO_WIPE.coerceAtMost(cachedTotalBlocks.toInt())
 
-            val massDevices = UsbMassStorageDevice.getMassStorageDevices(context)
-            if (massDevices.isEmpty()) {
-                Log.e(TAG, "No mass storage devices found")
-                return false
+            addLog("Block size: $cachedBlockSize bytes")
+            addLog("Wiping first $sectorsToWipe sectors (${formatSize((sectorsToWipe * cachedBlockSize).toLong())})")
+
+            var sectorsWiped = 0
+            val chunkSize = 32
+
+            while (sectorsWiped < sectorsToWipe) {
+                val remaining = sectorsToWipe - sectorsWiped
+                val toWrite = remaining.coerceAtMost(chunkSize)
+
+                var success = writeZeroSectors(blockDevice, sectorsWiped.toLong(), toWrite)
+
+                if (!success) {
+                    addLog("Chunk write failed, falling back to single sector writes...")
+                    success = true
+                    for (i in 0 until toWrite) {
+                        if (!writeZeroSector(blockDevice, (sectorsWiped + i).toLong())) {
+                            success = false
+                            break
+                        }
+                    }
+                }
+
+                if (!success) {
+                    addLog("⚠️  Failed to wipe sectors at $sectorsWiped")
+                    _isPreparing.value = false
+                    return false
+                }
+
+                sectorsWiped += toWrite
+                _flashProgress.value = (sectorsWiped.toFloat() / sectorsToWipe) * 0.05f
+
+                if (sectorsWiped % 256 == 0 || sectorsWiped == sectorsToWipe) {
+                    val percent = (sectorsWiped * 100) / sectorsToWipe
+                    addLog("Wiping: $percent% ($sectorsWiped/$sectorsToWipe sectors)")
+                }
+
+                yield()
             }
 
-            val massStorageDevice = massDevices[0]
-            massStorageDevice.init()
-            currentMassStorageDevice = massStorageDevice
+            addLog("✓ Wiped ${formatSize((sectorsWiped * cachedBlockSize).toLong())}")
 
-            // Create block device
-            val blockDevice = createBlockDevice(massStorageDevice)
-            if (blockDevice != null) {
-                currentBlockDevice = blockDevice
-                cachedBlockSize = blockDevice.blockSize
-                cachedTotalBlocks = blockDevice.blocks
-                Log.d(TAG, "Block device re-initialized successfully")
-                Log.d(TAG, "  - Block size: $cachedBlockSize")
-                Log.d(TAG, "  - Total blocks: $cachedTotalBlocks")
-                return true
+            // Wipe backup GPT
+            val backupGptStart = cachedTotalBlocks - 34
+            if (backupGptStart > sectorsToWipe) {
+                addLog("Clearing backup GPT...")
+                var gptWiped = 0
+                for (i in 0 until 34) {
+                    if (writeZeroSector(blockDevice, backupGptStart + i)) {
+                        gptWiped++
+                    }
+                }
+                addLog("✓ Cleared $gptWiped/34 backup GPT sectors")
             }
 
-            Log.e(TAG, "Could not create block device after re-init")
-            return false
+            _isPreparing.value = false
+            addLog("✓ Drive preparation complete")
+            return true
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error re-initializing device: ${e.message}")
-            e.printStackTrace()
+            Log.e(TAG, "Error preparing drive", e)
+            addLog("⚠️  Drive preparation failed: ${e.message}")
+            _isPreparing.value = false
             return false
         }
     }
 
     /**
-     * Format the USB drive to FAT32.
+     * Write data blocks with retry logic
      */
-    fun formatDevice(onComplete: (Boolean, String) -> Unit) {
+    private suspend fun writeDataBlocks(
+        blockDevice: BlockDeviceDriver,
+        startSector: Long,
+        data: ByteArray,
+        dataLength: Int,
+        context: Context
+    ): Boolean {
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val sectorsNeeded = (dataLength + cachedBlockSize - 1) / cachedBlockSize
+                val alignedSize = sectorsNeeded * cachedBlockSize
+
+                val buffer = ByteBuffer.allocate(alignedSize).apply {
+                    order(ByteOrder.LITTLE_ENDIAN)
+                    put(data, 0, dataLength)
+                    clear()
+                }
+
+                writeMutex.withLock {
+                    blockDevice.write(startSector, buffer)
+                }
+
+                return true
+
+            } catch (e: Exception) {
+                Log.w(TAG, "Write error at sector $startSector (attempt ${attempt + 1}): ${e.message}")
+
+                if (attempt < MAX_RETRIES - 1) {
+                    delay(RETRY_DELAY_MS * (attempt + 1))
+
+                    if (attempt >= 2) {
+                        Log.d(TAG, "Attempting USB reconnection...")
+                        try {
+                            val freshDevice = createFreshBlockDevice(context)
+                            if (freshDevice != null) {
+                                currentBlockDevice = freshDevice
+                                Log.d(TAG, "USB reconnected successfully")
+                            }
+                        } catch (reconnectError: Exception) {
+                            Log.e(TAG, "Reconnection failed: ${reconnectError.message}")
+                        }
+                    }
+                }
+            }
+        }
+
+        Log.e(TAG, "Write failed after $MAX_RETRIES attempts at sector $startSector")
+        return false
+    }
+
+    /**
+     * Read blocks with reconnection support
+     */
+    private suspend fun readDataBlocksWithReconnect(
+        context: Context,
+        startSector: Long,
+        sectorCount: Int
+    ): ByteArray? {
+        repeat(MAX_RETRIES) { attempt ->
+            try {
+                val blockDevice = currentBlockDevice ?: return null
+
+                val bufferSize = sectorCount * cachedBlockSize
+                val buffer = ByteBuffer.allocate(bufferSize).apply {
+                    order(ByteOrder.LITTLE_ENDIAN)
+                }
+
+                blockDevice.read(startSector, buffer)
+
+                val result = ByteArray(bufferSize)
+                buffer.flip()
+                buffer.get(result)
+                return result
+
+            } catch (e: Exception) {
+                Log.w(TAG, "Read error at sector $startSector (attempt ${attempt + 1}): ${e.message}")
+
+                if (attempt < MAX_RETRIES - 1) {
+                    delay(RETRY_DELAY_MS * (attempt + 1))
+
+                    // Try to reconnect
+                    Log.d(TAG, "Attempting USB reconnection for read...")
+                    try {
+                        val freshDevice = createFreshBlockDevice(context, RECONNECT_DELAY_MS)
+                        if (freshDevice != null) {
+                            currentBlockDevice = freshDevice
+                            Log.d(TAG, "USB reconnected successfully for read")
+                        }
+                    } catch (reconnectError: Exception) {
+                        Log.e(TAG, "Reconnection failed: ${reconnectError.message}")
+                    }
+                }
+            }
+        }
+
+        Log.e(TAG, "Read failed after $MAX_RETRIES attempts at sector $startSector")
+        return null
+    }
+
+    /**
+     * Compute SHA-256 hash of entire file
+     */
+    private fun computeFileSHA256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(READ_BLOCK_SIZE)
+        var bytesRead: Int
+
+        FileInputStream(file).use { input ->
+            while (input.read(buffer).also { bytesRead = it } != -1) {
+                digest.update(buffer, 0, bytesRead)
+            }
+        }
+
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Analyze ISO file to detect boot type
+     */
+    private fun analyzeIsoBootType(file: File): IsoBootInfo {
+        val info = IsoBootInfo()
+
+        RandomAccessFile(file, "r").use { raf ->
+            val sector0 = ByteArray(512)
+            raf.read(sector0)
+
+            info.hasMbrSignature = sector0[510] == 0x55.toByte() && sector0[511] == 0xAA.toByte()
+
+            info.hasBootCode = sector0[0] == 0xEB.toByte() ||
+                    sector0[0] == 0xE9.toByte() ||
+                    (sector0[0] == 0x00.toByte() && sector0[1] == 0x00.toByte())
+
+            var hasActivePartition = false
+            var hasGptProtectiveMbr = false
+            for (i in 0..3) {
+                val partitionOffset = 446 + (i * 16)
+                val bootFlag = sector0[partitionOffset]
+                val partitionType = sector0[partitionOffset + 4]
+
+                if (bootFlag == 0x80.toByte()) {
+                    hasActivePartition = true
+                }
+                if (partitionType == 0xEE.toByte()) {
+                    hasGptProtectiveMbr = true
+                }
+            }
+            info.hasActivePartition = hasActivePartition
+            info.hasGptProtectiveMbr = hasGptProtectiveMbr
+
+            if (file.length() >= 1024) {
+                raf.seek(512)
+                val sector1 = ByteArray(512)
+                raf.read(sector1)
+
+                val gptSignature = String(sector1, 0, 8, Charsets.US_ASCII)
+                info.hasGptHeader = gptSignature == "EFI PART"
+            }
+
+            if (file.length() >= 32768 + 6) {
+                raf.seek(32768)
+                val isoSector = ByteArray(6)
+                raf.read(isoSector)
+                val isoSignature = String(isoSector, 1, 5, Charsets.US_ASCII)
+                info.hasIso9660 = isoSignature == "CD001"
+            }
+
+            if (file.length() >= 32768 + 2048) {
+                raf.seek(32768 + 71)
+                val elToritoCheck = ByteArray(32)
+                raf.read(elToritoCheck)
+                val elToritoId = String(elToritoCheck, Charsets.US_ASCII).trim()
+                info.hasElTorito = elToritoId.contains("EL TORITO")
+            }
+
+            info.firstSector = sector0
+        }
+
+        info.bootType = when {
+            info.hasGptHeader && info.hasGptProtectiveMbr -> BootType.GPT
+            info.hasGptHeader && info.hasMbrSignature -> BootType.HYBRID
+            info.hasMbrSignature -> BootType.MBR
+            info.hasIso9660 -> BootType.ISO9660
+            else -> BootType.UNKNOWN
+        }
+
+        return info
+    }
+
+    private data class IsoBootInfo(
+        var hasMbrSignature: Boolean = false,
+        var hasBootCode: Boolean = false,
+        var hasActivePartition: Boolean = false,
+        var hasGptProtectiveMbr: Boolean = false,
+        var hasGptHeader: Boolean = false,
+        var hasIso9660: Boolean = false,
+        var hasElTorito: Boolean = false,
+        var bootType: BootType = BootType.UNKNOWN,
+        var firstSector: ByteArray = ByteArray(512)
+    )
+
+    private enum class BootType {
+        MBR, GPT, HYBRID, ISO9660, UNKNOWN
+    }
+
+    /**
+     * Flash the ISO image to USB drive
+     */
+    fun flashImage(isoPath: String, onComplete: (Boolean, String) -> Unit) {
         val context = appContext
 
         if (context == null) {
@@ -274,415 +675,436 @@ object UsbHelper {
             return
         }
 
-        scope.launch {
-            _isFormatting.value = true
-            _formatProgress.value = 0f
+        val isoFile = File(isoPath)
+        if (!isoFile.exists()) {
+            onComplete(false, "ISO file not found: $isoPath")
+            return
+        }
+
+        flashJob = scope.launch {
+            _isFlashing.value = true
+            _flashProgress.value = 0f
+            _flashLogs.value = emptyList()
+            _flashComplete.value = false
+            _flashError.value = null
+            _isVerifying.value = false
+            _verificationProgress.value = 0f
+            _isPreparing.value = false
+
+            var inputStream: FileInputStream? = null
 
             try {
-                // Ensure we have a valid block device
-                if (!ensureBlockDevice(context)) {
+                addLog("═══════════════════════════════════════════")
+                addLog("         PearBoot ISO Flasher v2.3")
+                addLog("═══════════════════════════════════════════")
+                addLog("")
+
+                // Step 1: Analyze ISO
+                addLog("Analyzing ISO file...")
+                val isoInfo = analyzeIsoBootType(isoFile)
+
+                addLog("ISO file: ${isoFile.name}")
+                addLog("ISO size: ${formatSize(isoFile.length())}")
+                addLog("")
+                addLog("Boot Structure Analysis:")
+                addLog("  Boot type: ${isoInfo.bootType}")
+                addLog("  MBR signature: ${if (isoInfo.hasMbrSignature) "YES ✓" else "NO"}")
+                addLog("  Boot code: ${if (isoInfo.hasBootCode) "YES ✓" else "NO"}")
+                addLog("  Active partition: ${if (isoInfo.hasActivePartition) "YES ✓" else "NO"}")
+                addLog("  GPT header: ${if (isoInfo.hasGptHeader) "YES ✓" else "NO"}")
+                addLog("  ISO 9660: ${if (isoInfo.hasIso9660) "YES ✓" else "NO"}")
+                addLog("  El Torito: ${if (isoInfo.hasElTorito) "YES ✓" else "NO"}")
+
+                // Step 2: Compute checksum
+                addLog("")
+                addLog("Computing ISO checksum...")
+                val isoHash = computeFileSHA256(isoFile)
+                addLog("ISO SHA-256: ${isoHash.take(16)}...${isoHash.takeLast(16)}")
+
+                // Step 3: Initialize USB connection
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("        INITIALIZING USB DEVICE")
+                addLog("════════════════════════════════════════")
+                addLog("")
+
+                var blockDevice = createFreshBlockDevice(context)
+
+                if (blockDevice == null) {
+                    _flashError.value = "Could not access USB device"
                     withContext(Dispatchers.Main) {
-                        _isFormatting.value = false
+                        _isFlashing.value = false
                         onComplete(false, "Could not access USB device. Please reconnect and try again.")
                     }
                     return@launch
                 }
 
-                val blockDevice = currentBlockDevice
-                if (blockDevice == null) {
+                addLog("USB connection established ✓")
+                addLog("")
+                addLog("USB Device Info:")
+                addLog("  Name: ${_name.value}")
+                addLog("  Block size: $cachedBlockSize bytes")
+                addLog("  Total sectors: $cachedTotalBlocks")
+
+                val deviceCapacity = cachedTotalBlocks * cachedBlockSize.toLong()
+                val isoSize = isoFile.length()
+
+                addLog("  Capacity: ${formatSize(deviceCapacity)}")
+
+                if (isoSize > deviceCapacity) {
+                    _flashError.value = "ISO is larger than USB drive"
                     withContext(Dispatchers.Main) {
-                        _isFormatting.value = false
-                        onComplete(false, "Block device not available")
+                        _isFlashing.value = false
+                        onComplete(false, "ISO file (${formatSize(isoSize)}) is larger than USB drive (${formatSize(deviceCapacity)})")
                     }
                     return@launch
                 }
 
-                Log.i(TAG, "Starting FAT32 format...")
-                Log.d(TAG, "Device: totalBlocks=$cachedTotalBlocks, blockSize=$cachedBlockSize")
+                // Step 4: PREPARE DRIVE
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("         PREPARING DRIVE")
+                addLog("════════════════════════════════════════")
+                addLog("")
+                addLog("⚠️  This will ERASE all data on the drive!")
+                addLog("")
 
-                val totalBlocks = cachedTotalBlocks
-                val totalBytes = totalBlocks * cachedBlockSize
+                var prepareSuccess = prepareDriveForFlashing(blockDevice, context)
 
-                // Validate size (FAT32 supports 32MB to 2TB)
-                if (totalBytes < 32 * 1024 * 1024) {
-                    withContext(Dispatchers.Main) {
-                        _isFormatting.value = false
-                        onComplete(false, "Device too small for FAT32 (min 32MB)")
+                if (!prepareSuccess) {
+                    addLog("Retrying drive preparation with fresh connection...")
+                    blockDevice = createFreshBlockDevice(context, RECONNECT_DELAY_MS)
+
+                    if (blockDevice != null) {
+                        currentBlockDevice = blockDevice
+                        prepareSuccess = prepareDriveForFlashing(blockDevice, context)
                     }
-                    return@launch
+
+                    if (!prepareSuccess) {
+                        _flashError.value = "Could not prepare USB device"
+                        withContext(Dispatchers.Main) {
+                            _isFlashing.value = false
+                            onComplete(false, "Failed to prepare USB drive. Please try a different USB drive.")
+                        }
+                        return@launch
+                    }
                 }
 
-                _formatProgress.value = 0.05f
+                // Step 5: Write ISO image
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("        WRITING ISO IMAGE")
+                addLog("════════════════════════════════════════")
+                addLog("")
 
-                // Step 1: Write MBR
-                Log.d(TAG, "Step 1: Writing MBR...")
-                writeMBR(blockDevice, totalBlocks, cachedBlockSize)
-                _formatProgress.value = 0.15f
+                val writeChunkSize = WRITE_SECTORS_PER_CHUNK * cachedBlockSize
+                addLog("Write Configuration:")
+                addLog("  Chunk size: ${formatSize(writeChunkSize.toLong())} ($WRITE_SECTORS_PER_CHUNK sectors)")
+                addLog("  Max retries: $MAX_RETRIES")
+                addLog("")
+                addLog("⚠️  DO NOT disconnect the USB drive!")
+                addLog("⚠️  DO NOT move your device!")
+                addLog("")
 
-                // Step 2: Calculate FAT32 parameters
-                val fat32Params = calculateFat32Params(totalBlocks, cachedBlockSize)
-                _formatProgress.value = 0.20f
+                inputStream = FileInputStream(isoFile)
+                val buffer = ByteArray(writeChunkSize)
+                var currentSector = 0L
+                var bytesWritten = 0L
+                var lastProgressPercent = -1
+                val startTime = System.currentTimeMillis()
 
-                // Step 3: Write FAT32 Boot Sector
-                Log.d(TAG, "Step 2: Writing FAT32 boot sector...")
-                writeFat32BootSector(blockDevice, fat32Params, cachedBlockSize)
-                _formatProgress.value = 0.30f
+                val writeProgressStart = 0.05f
+                val writeProgressEnd = 0.90f
 
-                // Step 4: Write FSInfo sector
-                Log.d(TAG, "Step 3: Writing FSInfo...")
-                writeFSInfo(blockDevice, fat32Params, cachedBlockSize)
-                _formatProgress.value = 0.40f
+                while (isActive) {
+                    val bytesRead = inputStream.read(buffer)
+                    if (bytesRead == -1) break
 
-                // Step 5: Write backup boot sector
-                Log.d(TAG, "Step 4: Writing backup boot sector...")
-                writeBackupBootSector(blockDevice, fat32Params, cachedBlockSize)
-                _formatProgress.value = 0.50f
+                    val currentDev = currentBlockDevice
+                    if (currentDev == null) {
+                        throw Exception("USB device disconnected")
+                    }
 
-                // Step 6: Initialize FAT tables
-                Log.d(TAG, "Step 5: Initializing FAT tables...")
-                initializeFatTables(blockDevice, fat32Params, cachedBlockSize)
-                _formatProgress.value = 0.80f
+                    val writeSuccess = writeDataBlocks(
+                        currentDev,
+                        currentSector,
+                        buffer,
+                        bytesRead,
+                        context
+                    )
 
-                // Step 7: Initialize root directory
-                Log.d(TAG, "Step 6: Initializing root directory...")
-                initializeRootDirectory(blockDevice, fat32Params, cachedBlockSize)
-                _formatProgress.value = 0.95f
+                    if (!writeSuccess) {
+                        throw Exception("Write failed at sector $currentSector after $MAX_RETRIES retries")
+                    }
 
-                Log.i(TAG, "FAT32 format completed successfully!")
+                    val sectorsWritten = (bytesRead + cachedBlockSize - 1) / cachedBlockSize
+                    currentSector += sectorsWritten
+                    bytesWritten += bytesRead
 
-                // Close and reinitialize device
+                    val writeProgress = (bytesWritten.toFloat() / isoSize)
+                    _flashProgress.value = writeProgressStart + (writeProgress * (writeProgressEnd - writeProgressStart))
+
+                    val progressPercent = (_flashProgress.value * 100).toInt()
+                    if (progressPercent / 5 > lastProgressPercent / 5) {
+                        lastProgressPercent = progressPercent
+                        val elapsed = System.currentTimeMillis() - startTime
+                        val speed = if (elapsed > 0) bytesWritten * 1000.0 / elapsed else 0.0
+                        addLog("Progress: $progressPercent% | ${formatSize(bytesWritten)} | ${formatSize(speed.toLong())}/s")
+                    }
+
+                    yield()
+                }
+
+                inputStream.close()
+                inputStream = null
+
+                val writeTime = System.currentTimeMillis() - startTime
+                val avgSpeed = if (writeTime > 0) bytesWritten * 1000.0 / writeTime else 0.0
+
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("          WRITE COMPLETE")
+                addLog("════════════════════════════════════════")
+                addLog("")
+                addLog("Statistics:")
+                addLog("  Total written: ${formatSize(bytesWritten)}")
+                addLog("  Total sectors: $currentSector")
+                addLog("  Time elapsed: ${writeTime / 1000}s")
+                addLog("  Average speed: ${formatSize(avgSpeed.toLong())}/s")
+
+                // Step 6: Verification - RECONNECT DEVICE FIRST
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("         STARTING VERIFICATION")
+                addLog("════════════════════════════════════════")
+                addLog("")
+                addLog("Reconnecting device for verification...")
+
+                // Close current connection and let device settle
                 closeCurrentDevice()
+                addLog("Waiting for device to settle...")
+                delay(POST_WRITE_SETTLE_MS)
 
-                delay(1500) // Give device time to settle
+                // Create fresh connection for verification
+                val verifyDevice = createFreshBlockDevice(context, RECONNECT_DELAY_MS)
 
-                _formatProgress.value = 1f
+                if (verifyDevice == null) {
+                    addLog("⚠️  Could not reconnect for verification")
+                    addLog("   Write completed, but verification skipped")
+                    addLog("")
+                    addLog("   The flash likely succeeded. Try booting from the USB.")
+                } else {
+                    currentBlockDevice = verifyDevice
+                    addLog("✓ Device reconnected for verification")
+                    addLog("")
 
-                // Rescan device
+                    _isVerifying.value = true
+                    _verificationProgress.value = 0f
+
+                    val verifyProgressStart = 0.90f
+                    val verifyProgressEnd = 1.0f
+
+                    // Verify only first few MB and boot sector for speed
+                    val verifySize = minOf(isoFile.length(), 10L * 1024 * 1024)  // Max 10MB
+                    val verifyStream = FileInputStream(isoFile)
+                    val verifyChunkSize = 64 * 1024  // 64KB chunks for verification
+                    val verifySourceBuffer = ByteArray(verifyChunkSize)
+
+                    var verifyOffset = 0L
+                    var verifyErrors = 0
+                    var verifyBytes = 0L
+
+                    addLog("Verifying first ${formatSize(verifySize)} of data...")
+
+                    try {
+                        while (isActive && verifyBytes < verifySize) {
+                            val toRead = minOf(verifyChunkSize.toLong(), verifySize - verifyBytes).toInt()
+                            val sourceRead = verifyStream.read(verifySourceBuffer, 0, toRead)
+                            if (sourceRead == -1) break
+
+                            val startVerifySector = verifyOffset / cachedBlockSize
+                            val sectorsToRead = (sourceRead + cachedBlockSize - 1) / cachedBlockSize
+
+                            val deviceData = readDataBlocksWithReconnect(context, startVerifySector, sectorsToRead)
+
+                            if (deviceData == null) {
+                                verifyErrors++
+                                if (verifyErrors <= 3) {
+                                    addLog("⚠️  Verification read failed at offset ${formatSize(verifyOffset)}")
+                                }
+                                if (verifyErrors >= 5) {
+                                    addLog("⚠️  Too many read errors, stopping verification")
+                                    break
+                                }
+                            } else {
+                                var mismatch = false
+                                for (i in 0 until sourceRead) {
+                                    if (verifySourceBuffer[i] != deviceData[i]) {
+                                        mismatch = true
+                                        break
+                                    }
+                                }
+
+                                if (mismatch) {
+                                    verifyErrors++
+                                    if (verifyErrors <= 3) {
+                                        addLog("⚠️  Data mismatch at offset ${formatSize(verifyOffset)}")
+                                    }
+                                }
+                            }
+
+                            verifyOffset += sourceRead
+                            verifyBytes += sourceRead
+
+                            _verificationProgress.value = (verifyBytes.toFloat() / verifySize).coerceIn(0f, 1f)
+
+                            val verifyProgress = verifyBytes.toFloat() / verifySize
+                            _flashProgress.value = verifyProgressStart + (verifyProgress * (verifyProgressEnd - verifyProgressStart))
+
+                            val verifyPercent = (_verificationProgress.value * 100).toInt()
+                            if (verifyPercent % 20 == 0 && verifyPercent > 0) {
+                                val logged = _flashLogs.value.lastOrNull()?.contains("Verifying: $verifyPercent%") != true
+                                if (logged) {
+                                    addLog("Verifying: $verifyPercent%")
+                                }
+                            }
+
+                            yield()
+                        }
+
+                        verifyStream.close()
+
+                        addLog("")
+                        if (verifyErrors == 0) {
+                            addLog("✓ Verification PASSED - Data verified correctly!")
+                        } else if (verifyErrors < 5) {
+                            addLog("⚠️  Verification completed with $verifyErrors issues")
+                            addLog("   The flash may still work - try booting from the USB")
+                        } else {
+                            addLog("⚠️  Verification had multiple errors")
+                            addLog("   The USB may still be bootable - please try it")
+                        }
+
+                    } catch (e: Exception) {
+                        addLog("⚠️  Verification error: ${e.message}")
+                        addLog("   Write completed - try booting from the USB")
+                        try { verifyStream.close() } catch (_: Exception) {}
+                    }
+                }
+
+                _isVerifying.value = false
+
+                // Boot sector quick check
+                addLog("")
+                addLog("Checking boot sector...")
+
+                val finalDevice = currentBlockDevice
+                if (finalDevice != null) {
+                    val bootSector = readDataBlocksWithReconnect(context, 0, 1)
+
+                    if (bootSector != null && bootSector.size >= 512) {
+                        val usbHasMbr = bootSector[510] == 0x55.toByte() &&
+                                bootSector[511] == 0xAA.toByte()
+
+                        val sourceMatch = bootSector.take(512).toByteArray()
+                            .contentEquals(isoInfo.firstSector)
+
+                        addLog("  MBR signature: ${if (usbHasMbr) "PRESENT ✓" else "MISSING ⚠️"}")
+                        addLog("  Boot sector match: ${if (sourceMatch) "YES ✓" else "DIFFERS ⚠️"}")
+
+                        val firstBytes = bootSector.take(16).joinToString(" ") { "%02X".format(it) }
+                        addLog("  First 16 bytes: $firstBytes")
+                    } else {
+                        addLog("  Could not read boot sector for verification")
+                    }
+                }
+
+                addLog("")
+                addLog("═══════════════════════════════════════════")
+                addLog("          ✓ FLASH COMPLETED!")
+                addLog("═══════════════════════════════════════════")
+                addLog("")
+                addLog("You can now safely remove the USB drive")
+                addLog("and boot from it.")
+                addLog("")
+                addLog("BIOS/UEFI Boot Tips:")
+                addLog("  • Press F12/F2/Del/Esc during startup")
+                addLog("  • Select USB device from boot menu")
+                addLog("  • Try both Legacy and UEFI modes")
+                addLog("  • Disable Secure Boot if needed")
+
+                _flashProgress.value = 1f
+                _flashComplete.value = true
+
                 withContext(Dispatchers.Main) {
-                    _isFormatting.value = false
-                    _needsFormat.value = false
-                    onComplete(true, "Format completed successfully")
+                    _isFlashing.value = false
+                    onComplete(true, "Flash completed successfully!")
+                }
 
-                    // Trigger rescan
-                    scan(context)
+            } catch (e: CancellationException) {
+                inputStream?.close()
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("         FLASH CANCELLED")
+                addLog("════════════════════════════════════════")
+                _flashError.value = "Flash cancelled"
+                withContext(Dispatchers.Main) {
+                    _isFlashing.value = false
+                    _isVerifying.value = false
+                    _isPreparing.value = false
+                    onComplete(false, "Flash cancelled")
                 }
 
             } catch (e: Exception) {
-                Log.e(TAG, "Error formatting device", e)
+                inputStream?.close()
+                Log.e(TAG, "Error flashing device", e)
                 e.printStackTrace()
+                addLog("")
+                addLog("════════════════════════════════════════")
+                addLog("              ERROR")
+                addLog("════════════════════════════════════════")
+                addLog("")
+                addLog("Error: ${e.message}")
+                addLog("")
+                addLog("Troubleshooting:")
+                addLog("  • Reconnect the USB drive")
+                addLog("  • Try a different USB port/cable")
+                addLog("  • Try a different USB drive")
+                addLog("  • Restart the app")
+
+                _flashError.value = e.message
 
                 withContext(Dispatchers.Main) {
-                    _isFormatting.value = false
-                    onComplete(false, "Format failed: ${e.message}")
+                    _isFlashing.value = false
+                    _isVerifying.value = false
+                    _isPreparing.value = false
+                    onComplete(false, "Flash failed: ${e.message}")
                 }
             }
         }
     }
 
-    // ==================== FAT32 Formatting Implementation ====================
-
-    private data class Fat32Params(
-        val totalSectors: Long,
-        val sectorsPerCluster: Int,
-        val reservedSectors: Int,
-        val fatSize: Long,
-        val rootCluster: Int,
-        val partitionStartSector: Long,
-        val partitionSectors: Long
-    )
-
-    private fun calculateFat32Params(totalBlocks: Long, blockSize: Int): Fat32Params {
-        val partitionStartSector = 2048L
-        val partitionSectors = totalBlocks - partitionStartSector
-
-        val sectorsPerCluster = when {
-            partitionSectors <= 66600L -> 1
-            partitionSectors <= 532480L -> 8
-            partitionSectors <= 16777216L -> 8
-            partitionSectors <= 33554432L -> 16
-            partitionSectors <= 67108864L -> 32
-            else -> 64
-        }
-
-        val reservedSectors = 32
-
-        val dataSectors = partitionSectors - reservedSectors
-        val totalClusters = dataSectors / sectorsPerCluster
-        val fatEntries = totalClusters + 2
-        val fatBytes = fatEntries * 4
-        val fatSize = ((fatBytes + blockSize - 1) / blockSize).toLong()
-
-        Log.d(TAG, "FAT32 Params:")
-        Log.d(TAG, "  - Partition start: $partitionStartSector")
-        Log.d(TAG, "  - Partition sectors: $partitionSectors")
-        Log.d(TAG, "  - Sectors per cluster: $sectorsPerCluster")
-        Log.d(TAG, "  - Reserved sectors: $reservedSectors")
-        Log.d(TAG, "  - FAT size (sectors): $fatSize")
-
-        return Fat32Params(
-            totalSectors = totalBlocks,
-            sectorsPerCluster = sectorsPerCluster,
-            reservedSectors = reservedSectors,
-            fatSize = fatSize,
-            rootCluster = 2,
-            partitionStartSector = partitionStartSector,
-            partitionSectors = partitionSectors
-        )
+    fun cancelFlash() {
+        flashJob?.cancel()
+        _isFlashing.value = false
+        _isVerifying.value = false
+        _isPreparing.value = false
+        addLog("Flash cancelled by user")
     }
 
-    private fun writeMBR(blockDevice: BlockDeviceDriver, totalBlocks: Long, blockSize: Int) {
-        val mbr = ByteBuffer.allocate(blockSize)
-        mbr.order(ByteOrder.LITTLE_ENDIAN)
-
-        // Clear MBR
-        for (i in 0 until blockSize) {
-            mbr.put(0.toByte())
-        }
-        mbr.rewind()
-
-        val partitionStart = 2048L
-        val partitionSectors = (totalBlocks - partitionStart).coerceAtMost(0xFFFFFFFF)
-
-        // First partition entry at offset 446
-        mbr.position(446)
-        mbr.put(0x00.toByte())  // Boot indicator
-        mbr.put(0x00.toByte())  // CHS start head
-        mbr.put(0x01.toByte())  // CHS start sector
-        mbr.put(0x00.toByte())  // CHS start cylinder
-        mbr.put(0x0C.toByte())  // Partition type: FAT32 LBA
-        mbr.put(0xFE.toByte())  // CHS end head
-        mbr.put(0xFF.toByte())  // CHS end sector
-        mbr.put(0xFF.toByte())  // CHS end cylinder
-        mbr.putInt(partitionStart.toInt())  // LBA start
-        mbr.putInt(partitionSectors.toInt())  // Number of sectors
-
-        // MBR signature
-        mbr.position(510)
-        mbr.put(0x55.toByte())
-        mbr.put(0xAA.toByte())
-
-        mbr.rewind()
-        blockDevice.write(0, mbr)
-        Log.d(TAG, "MBR written successfully")
+    fun resetFlashState() {
+        _isFlashing.value = false
+        _flashProgress.value = 0f
+        _flashLogs.value = emptyList()
+        _flashComplete.value = false
+        _flashError.value = null
+        _isVerifying.value = false
+        _verificationProgress.value = 0f
+        _isPreparing.value = false
     }
 
-    private fun writeFat32BootSector(blockDevice: BlockDeviceDriver, params: Fat32Params, blockSize: Int) {
-        val bootSector = ByteBuffer.allocate(blockSize)
-        bootSector.order(ByteOrder.LITTLE_ENDIAN)
-
-        for (i in 0 until blockSize) {
-            bootSector.put(0.toByte())
-        }
-        bootSector.rewind()
-
-        // Jump instruction
-        bootSector.put(0xEB.toByte())
-        bootSector.put(0x58.toByte())
-        bootSector.put(0x90.toByte())
-
-        // OEM Name
-        val oemName = "PEARBOOT"
-        for (i in 0 until 8) {
-            bootSector.put(if (i < oemName.length) oemName[i].code.toByte() else 0x20.toByte())
-        }
-
-        // BPB
-        bootSector.putShort(blockSize.toShort())
-        bootSector.put(params.sectorsPerCluster.toByte())
-        bootSector.putShort(params.reservedSectors.toShort())
-        bootSector.put(2.toByte())  // Number of FATs
-        bootSector.putShort(0.toShort())  // Root entry count
-        bootSector.putShort(0.toShort())  // Total sectors 16
-        bootSector.put(0xF8.toByte())  // Media type
-        bootSector.putShort(0.toShort())  // FAT size 16
-        bootSector.putShort(63.toShort())  // Sectors per track
-        bootSector.putShort(255.toShort())  // Number of heads
-        bootSector.putInt(params.partitionStartSector.toInt())  // Hidden sectors
-        bootSector.putInt(params.partitionSectors.toInt())  // Total sectors 32
-
-        // FAT32 Extended BPB
-        bootSector.putInt(params.fatSize.toInt())
-        bootSector.putShort(0.toShort())  // Ext flags
-        bootSector.putShort(0.toShort())  // FS version
-        bootSector.putInt(params.rootCluster)
-        bootSector.putShort(1.toShort())  // FSInfo sector
-        bootSector.putShort(6.toShort())  // Backup boot sector
-
-        // Reserved
-        for (i in 0 until 12) {
-            bootSector.put(0.toByte())
-        }
-
-        bootSector.put(0x80.toByte())  // Drive number
-        bootSector.put(0.toByte())  // Reserved
-        bootSector.put(0x29.toByte())  // Boot signature
-        bootSector.putInt(System.currentTimeMillis().toInt())  // Volume serial
-
-        // Volume label
-        val label = "PEARBOOT   "
-        for (i in 0 until 11) {
-            bootSector.put(label[i].code.toByte())
-        }
-
-        // File system type
-        val fsType = "FAT32   "
-        for (i in 0 until 8) {
-            bootSector.put(fsType[i].code.toByte())
-        }
-
-        // Signature
-        bootSector.position(510)
-        bootSector.put(0x55.toByte())
-        bootSector.put(0xAA.toByte())
-
-        bootSector.rewind()
-        blockDevice.write(params.partitionStartSector, bootSector)
-        Log.d(TAG, "FAT32 boot sector written successfully")
-    }
-
-    private fun writeFSInfo(blockDevice: BlockDeviceDriver, params: Fat32Params, blockSize: Int) {
-        val fsInfo = ByteBuffer.allocate(blockSize)
-        fsInfo.order(ByteOrder.LITTLE_ENDIAN)
-
-        for (i in 0 until blockSize) {
-            fsInfo.put(0.toByte())
-        }
-        fsInfo.rewind()
-
-        // Lead signature
-        fsInfo.putInt(0x41615252)
-
-        // Reserved
-        fsInfo.position(484)
-
-        // Structure signature
-        fsInfo.putInt(0x61417272)
-
-        // Free cluster count (unknown)
-        fsInfo.putInt(-1)
-
-        // Next free cluster hint
-        fsInfo.putInt(3)
-
-        // Reserved
-        fsInfo.position(508)
-        fsInfo.putShort(0.toShort())
-
-        // Trail signature
-        fsInfo.put(0x55.toByte())
-        fsInfo.put(0xAA.toByte())
-
-        fsInfo.rewind()
-        blockDevice.write(params.partitionStartSector + 1, fsInfo)
-        Log.d(TAG, "FSInfo written successfully")
-    }
-
-    private fun writeBackupBootSector(blockDevice: BlockDeviceDriver, params: Fat32Params, blockSize: Int) {
-        // Read the original boot sector
-        val bootSector = ByteBuffer.allocate(blockSize)
-        bootSector.order(ByteOrder.LITTLE_ENDIAN)
-        blockDevice.read(params.partitionStartSector, bootSector)
-
-        // Write as backup at sector 6
-        bootSector.rewind()
-        blockDevice.write(params.partitionStartSector + 6, bootSector)
-
-        // Write backup FSInfo at sector 7
-        val fsInfo = ByteBuffer.allocate(blockSize)
-        fsInfo.order(ByteOrder.LITTLE_ENDIAN)
-        blockDevice.read(params.partitionStartSector + 1, fsInfo)
-        fsInfo.rewind()
-        blockDevice.write(params.partitionStartSector + 7, fsInfo)
-        Log.d(TAG, "Backup boot sector written successfully")
-    }
-
-    private fun initializeFatTables(blockDevice: BlockDeviceDriver, params: Fat32Params, blockSize: Int) {
-        val fatStartSector = params.partitionStartSector + params.reservedSectors
-
-        // First FAT sector
-        val firstFatSector = ByteBuffer.allocate(blockSize)
-        firstFatSector.order(ByteOrder.LITTLE_ENDIAN)
-
-        for (i in 0 until blockSize) {
-            firstFatSector.put(0.toByte())
-        }
-        firstFatSector.rewind()
-
-        // Entry 0: Media type
-        firstFatSector.putInt(0x0FFFFFF8.toInt())
-        // Entry 1: End of chain
-        firstFatSector.putInt(0x0FFFFFFF.toInt())
-        // Entry 2: End of chain (root directory)
-        firstFatSector.putInt(0x0FFFFFFF.toInt())
-
-        // Write first sector of FAT1
-        firstFatSector.rewind()
-        blockDevice.write(fatStartSector, firstFatSector)
-
-        // Write first sector of FAT2
-        firstFatSector.rewind()
-        blockDevice.write(fatStartSector + params.fatSize, firstFatSector)
-
-        // Clear remaining FAT sectors (limit for performance)
-        val zeroSector = ByteBuffer.allocate(blockSize)
-        for (i in 0 until blockSize) {
-            zeroSector.put(0.toByte())
-        }
-
-        val maxFatSectors = params.fatSize.coerceAtMost(500)
-
-        for (i in 1 until maxFatSectors) {
-            zeroSector.rewind()
-            blockDevice.write(fatStartSector + i, zeroSector)
-        }
-
-        for (i in 1 until maxFatSectors) {
-            zeroSector.rewind()
-            blockDevice.write(fatStartSector + params.fatSize + i, zeroSector)
-        }
-
-        Log.d(TAG, "FAT tables initialized successfully")
-    }
-
-    private fun initializeRootDirectory(blockDevice: BlockDeviceDriver, params: Fat32Params, blockSize: Int) {
-        val dataStartSector = params.partitionStartSector +
-                params.reservedSectors +
-                (params.fatSize * 2)
-
-        val rootDirSector = dataStartSector + ((params.rootCluster - 2) * params.sectorsPerCluster)
-
-        // Create root directory with volume label
-        val rootDir = ByteBuffer.allocate(blockSize)
-        rootDir.order(ByteOrder.LITTLE_ENDIAN)
-
-        for (i in 0 until blockSize) {
-            rootDir.put(0.toByte())
-        }
-        rootDir.rewind()
-
-        // Volume label entry
-        val label = "PEARBOOT   "
-        for (i in 0 until 11) {
-            rootDir.put(label[i].code.toByte())
-        }
-        rootDir.put(0x08.toByte())  // Attribute: Volume Label
-
-        // Write root directory
-        rootDir.rewind()
-        blockDevice.write(rootDirSector, rootDir)
-
-        // Clear remaining sectors in root directory cluster
-        val zeroSector = ByteBuffer.allocate(blockSize)
-        for (i in 0 until blockSize) {
-            zeroSector.put(0.toByte())
-        }
-
-        for (i in 1 until params.sectorsPerCluster) {
-            zeroSector.rewind()
-            blockDevice.write(rootDirSector + i, zeroSector)
-        }
-
-        Log.d(TAG, "Root directory initialized successfully")
+    fun formatDevice(onComplete: (Boolean, String) -> Unit) {
+        onComplete(true, "Format not required - drive will be prepared during flash")
     }
 
     private fun requestPermission(context: Context, device: UsbDevice) {
@@ -704,23 +1126,23 @@ object UsbHelper {
         _isFormatting.value = false
         _formatProgress.value = 0f
 
+        flashJob?.cancel()
+        _isFlashing.value = false
+        _isVerifying.value = false
+        _isPreparing.value = false
+
         closeCurrentDevice()
-        cachedBlockSize = 512
+        cachedBlockSize = DEFAULT_BLOCK_SIZE
         cachedTotalBlocks = 0L
 
         Log.i(TAG, "USB Disconnected")
     }
 
     fun getMassStorageDevice(): UsbMassStorageDevice? = currentMassStorageDevice
-
     fun getBlockDevice(): BlockDeviceDriver? = currentBlockDevice
-
     fun getBlockSize(): Int = cachedBlockSize
-
     fun getTotalBlocks(): Long = cachedTotalBlocks
-
     fun getLastBlockAddress(): Long = cachedTotalBlocks - 1
-
     fun getCapacityBytes(): Long = cachedTotalBlocks * cachedBlockSize.toLong()
 
     private fun formatSize(bytes: Long): String {

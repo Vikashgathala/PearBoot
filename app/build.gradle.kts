@@ -1,5 +1,3 @@
-
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -8,14 +6,12 @@ plugins {
 
 android {
     namespace = "xyz.pearos.pearboot"
-    compileSdk {
-        version = release(36)
-    }
+    compileSdk = 36  // Updated to 36 as required by dependencies
 
     defaultConfig {
         applicationId = "xyz.pearos.pearboot"
-        minSdk = 31
-        targetSdk = 36
+        minSdk = 31      // Still supports Android 12+
+        targetSdk = 35   // Can keep targetSdk at 35
         versionCode = 1
         versionName = "1.0"
 
@@ -56,12 +52,18 @@ dependencies {
 
     // Lifecycle
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // USB Mass Storage
     implementation(libs.libaums.core)
     implementation(libs.libaums.libusbcommunication)
+
+    // Splash Screen
     implementation("androidx.core:core-splashscreen:1.0.1")
+
+    // Compose
     implementation("androidx.compose.material3:material3")
-    implementation ("androidx.compose.material:material-icons-extended")
+    implementation("androidx.compose.material:material-icons-extended")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -70,6 +72,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
